@@ -147,13 +147,14 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.target_layer_ids = build_target_layer_ids(config.num_target_layers, config.num_hidden_layers)
+        self.target_layer_ids = self.config.dflash_config.get("target_layer_ids", build_target_layer_ids(config.num_target_layers, config.num_hidden_layers))
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
