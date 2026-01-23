@@ -29,7 +29,7 @@ uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/16818/he
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
     --speculative-algorithm DFLASH \
-    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash-b16 \
+    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash \
     --tp-size 1 \
     --dtype bfloat16 \
     --attention-backend fa3 \
