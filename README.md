@@ -73,7 +73,6 @@ pip install flash-attn --no-build-isolation
 #### Example Usage
 The following example demonstrates how to load the DFlash drafter and the Qwen3-8B target model to perform speculative decoding.
 ```python
-import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # 1. Load the DFlash Draft Model
