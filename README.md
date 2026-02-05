@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 - **Qwen3-4B**: https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16  
 - **Qwen3-8B**: https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16  
 - **Qwen3-Coder-30B-A3B**: https://huggingface.co/z-lab/Qwen3-Coder-30B-A3B-DFlash
-- **meta-llama/Llama-3.1-8B-Instruct**: https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
+- **Llama-3.1-8B-Instruct**: https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
 
 ### 🚧 Coming Soon
 - **openai/gpt-oss-20b**  
