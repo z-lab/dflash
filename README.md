@@ -47,6 +47,7 @@ uv pip install "git+https://github.com/sgl-project/sglang.git@refs/pull/16818/he
 
 #### Serving
 ```bash
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
     --speculative-algorithm DFLASH \
