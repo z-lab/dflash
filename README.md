@@ -27,7 +27,8 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 - **Llama-3.1-8B-Instruct**: https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
 
 ### 🚧 Coming Soon
-- **zai-org/GLM-4.7**
+- **Qwen/Qwen3.5-27B**
+- **Qwen/Qwen3.5-122B-A10B**
 - **zai-org/GLM-4.7-Flash**
 
 > 💡 Feel free to open a GitHub issue if you’d like to request support for additional models!  
