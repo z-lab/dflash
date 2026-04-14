@@ -1,8 +1,8 @@
-import json
+import time
 import torch
-from pathlib import Path
-from typing import Optional, Callable
-from typing_extensions import Unpack, Tuple
+from types import SimpleNamespace
+from typing import Callable, Optional
+from typing_extensions import Unpack
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
@@ -20,84 +20,13 @@ from transformers import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-
-# ---------------------------------------------------------------------------
-# Dataset loading (auto-downloads from HuggingFace on first use)
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = Path(__file__).parent.parent / "cache"
-
-DATASETS = {
-    "gsm8k": {
-        "load_args": ("openai/gsm8k", "main"),
-        "load_kwargs": {"split": "test"},
-        "format": lambda x: "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
-    },
-    "math500": {
-        "load_args": ("HuggingFaceH4/MATH-500",),
-        "load_kwargs": {"split": "test"},
-        "format": lambda x: "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
-    },
-    "humaneval": {
-        "load_args": ("openai/openai_humaneval",),
-        "load_kwargs": {"split": "test"},
-        "format": lambda x: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{prompt}\n```".format(**x),
-    },
-    "mbpp": {
-        "load_args": ("google-research-datasets/mbpp", "sanitized"),
-        "load_kwargs": {"split": "test"},
-        "format": lambda x: x["prompt"],
-    },
-    "mt-bench": {
-        "load_args": ("HuggingFaceH4/mt_bench_prompts",),
-        "load_kwargs": {"split": "train"},
-        "format": lambda x: x["prompt"],  # list of turns
-        "multi_turn": True,
-    },
-}
-
-
-def _prepare_dataset(name: str) -> Path:
-    from datasets import load_dataset
-
-    cfg = DATASETS[name]
-    CACHE_DIR.mkdir(exist_ok=True)
-    out_path = CACHE_DIR / f"{name}.jsonl"
-
-    print(f"[download] {name} ...")
-    dataset = load_dataset(*cfg["load_args"], **cfg["load_kwargs"])
-
-    with open(out_path, "w") as f:
-        for row in dataset:
-            if cfg.get("multi_turn"):
-                turns = cfg["format"](row)
-            else:
-                turns = [cfg["format"](row)]
-            f.write(json.dumps({"turns": turns}) + "\n")
-
-    print(f"[cached] {out_path}  ({sum(1 for _ in open(out_path))} samples)")
-    return out_path
-
-
-def load_and_process_dataset(data_name: str) -> list[dict]:
-    if data_name not in DATASETS:
-        raise ValueError(f"Unknown dataset '{data_name}'. Available: {list(DATASETS.keys())}")
-
-    path = CACHE_DIR / f"{data_name}.jsonl"
-    if not path.exists():
-        _prepare_dataset(data_name)
-
-    with open(path) as f:
-        return [json.loads(line) for line in f]
-
-
 # ---------------------------------------------------------------------------
 # Model utilities
 # ---------------------------------------------------------------------------
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
-        return [(num_target_layers // 2)]
+        return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
@@ -125,11 +54,126 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def _cuda_time() -> float:
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def dflash_generate(
+    model: "DFlashDraftModel",
+    target: nn.Module,
+    input_ids: torch.LongTensor,
+    max_new_tokens: int,
+    stop_token_ids: Optional[list[int]],
+    temperature: float,
+    block_size: Optional[int] = None,
+    mask_token_id: Optional[int] = None,
+    return_stats: bool = False,
+):
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + max_new_tokens
+    block_size = model.block_size if block_size is None else block_size
+    mask_token_id = model.mask_token_id if mask_token_id is None else mask_token_id
+
+    output_ids = torch.full(
+        (1, max_length + block_size), mask_token_id, dtype=torch.long, device=target.device,
+    )
+    position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
+    past_key_values_target = DynamicCache()
+    past_key_values_draft = DynamicCache()
+
+    prefill_start = _cuda_time() if return_stats else None
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=block_size > 1,
+    )
+
+    output_ids[:, :num_input_tokens] = input_ids
+    output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
+    if block_size > 1:
+        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+    time_to_first_token = _cuda_time() - prefill_start if return_stats else None
+
+    decode_start = _cuda_time() if return_stats else None
+    acceptance_lengths = []
+    start = num_input_tokens
+    draft_prefill = True
+
+    while start < max_length:
+        block_output_ids = output_ids[:, start : start + block_size].clone()
+        block_position_ids = position_ids[:, start : start + block_size]
+        if block_size > 1:
+            noise_embedding = target.model.embed_tokens(block_output_ids)
+            draft_logits = target.lm_head(model(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+                is_causal=False,
+            )[:, 1 - block_size :, :])
+            past_key_values_draft.crop(start)
+            block_output_ids[:, 1:] = sample(draft_logits)
+            if draft_prefill and return_stats:
+                draft_prefill = False
+                decode_start = _cuda_time()
+
+        output = target(
+            block_output_ids,
+            position_ids=block_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=block_size > 1,
+        )
+
+        posterior = sample(output.logits, temperature)
+        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+        start += acceptance_length + 1
+        past_key_values_target.crop(start)
+        acceptance_lengths.append(acceptance_length + 1)
+
+        if block_size > 1:
+            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
+
+        if stop_token_ids is not None and any(
+            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
+        ):
+            break
+
+    output_ids = output_ids[:, :max_length]
+    output_ids = output_ids[:, output_ids[0] != mask_token_id]
+    if stop_token_ids is not None:
+        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
+        if stop_token_indices.numel() > 0:
+            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+
+    if not return_stats:
+        return output_ids
+
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    total_decode_time = _cuda_time() - decode_start
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=total_decode_time / num_output_tokens,
+        acceptance_lengths=acceptance_lengths,
+    )
+
+
 # ---------------------------------------------------------------------------
 # DFlash model
 # ---------------------------------------------------------------------------
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
@@ -230,9 +274,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -312,79 +356,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         temperature: float,
     ):
         self.eval()
-        num_input_tokens = input_ids.shape[1]
-        max_length = num_input_tokens + max_new_tokens
-
-        block_size = self.block_size
-        output_ids = torch.full(
-            (1, max_length + block_size),
-            self.mask_token_id,
-            dtype=torch.long,
-            device=target.device,
+        return dflash_generate(
+            self,
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
         )
-        position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-
-        past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
-
-        # Prefill stage
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
-        )
-
-        output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
-        target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
-
-        # Decode stage
-        acceptance_lengths = []
-        start = input_ids.shape[1]
-        while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(self(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-                is_causal=False,
-            )[:, -block_size+1:, :])
-            past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
-
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-
-            posterior = sample(output.logits, temperature)
-            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-            output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
-            start += acceptance_length + 1
-            past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[:, :acceptance_length + 1, :]
-            acceptance_lengths.append(acceptance_length+1)
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-            ):
-                break
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
-        if stop_token_ids is not None:
-            stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
-            if stop_token_indices.numel() > 0:
-                output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
-
-        return output_ids

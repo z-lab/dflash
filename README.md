@@ -20,8 +20,8 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 | Qwen3-Coder-30B-A3B | [z-lab/Qwen3-Coder-30B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3-Coder-30B-A3B-DFlash) |
 | gpt-oss-20b | [z-lab/gpt-oss-20b-DFlash](https://huggingface.co/z-lab/gpt-oss-20b-DFlash) |
 | gpt-oss-120b | [z-lab/gpt-oss-120b-DFlash](https://huggingface.co/z-lab/gpt-oss-120b-DFlash) |
-| Qwen3-4B | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
-| Qwen3-8B | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
+| Qwen3-4B (non-thinking) | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
+| Qwen3-8B (non-thinking) | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
 | Llama-3.1-8B-Instruct | [z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat](https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat) |
 | Qwen3.5-122B-A10B | Coming soon |
 | Qwen3.5-397B-A17B | Coming soon |
@@ -31,25 +31,19 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 📦 Installation
 
-Use a separate virtual environment for each to avoid conflict.
+Use a separate virtual environment for each backend. The Transformers backend is pinned to `transformers==4.57.1`, while `mlx-lm` currently tracks the Transformers 5.x line, so `.[transformers]` and `.[mlx]` should not be installed together.
 
 | Backend | Install command |
 |---|---|
-| **Transformers** | `uv pip install -e .` |
-| **SGLang** | `uv pip install -e ".[sglang]"` |
+| **Transformers** | `pip install -e ".[transformers]"` |
+| **SGLang** | `pip install -e ".[sglang]"` |
 | **vLLM** | See below |
-| **MLX** (Apple Silicon) | See below |
+| **MLX** (Apple Silicon) | `pip install -e ".[mlx]"` |
 
 **vLLM:** DFlash support requires the nightly build:
 ```bash
-uv pip install -e ".[vllm]"
-uv pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
-```
-
-**MLX:** For Apple Silicon Macs (M-series):
-```bash
-pip install -e .
-pip install mlx mlx-lm
+pip install -e ".[vllm]"
+pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
 ```
 
 ## 🚀 Quick Start
@@ -106,18 +100,21 @@ print(tokenizer.decode(output[0], skip_special_tokens=False))
 
 ### MLX (Apple Silicon)
 
-Supports all models including Qwen3.5 (with hybrid recurrent layers).
+Supports all models including the latest Qwen3.5.
 
 ```python
-from dflash.utils_mlx import load, load_draft
-from dflash.generate_mlx import stream_generate
+from dflash.model_mlx import load, load_draft, stream_generate
 
 model, tokenizer = load("Qwen/Qwen3.5-4B")
 draft = load_draft("z-lab/Qwen3.5-4B-DFlash")
 
-prompt = "How many positive whole-number divisors does 196 have?"
-for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tokens=2048):
+messages = [{"role": "user", "content": "How many positive whole-number divisors does 196 have?"}]
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+tps = 0.0
+for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tokens=2048, temperature=0.6):
     print(r.text, end="", flush=True)
+    tps = r.generation_tps
+print(f"\nThroughput: {tps:.2f} tok/s")
 ```
 
 ## 📊 Evaluation
@@ -145,11 +142,11 @@ torchrun --nproc_per_node=8 -m dflash.benchmark --backend transformers \
     --dataset gsm8k --max-samples 128
 ```
 
-**MLX** (Apple Silicon):
+**MLX**:
 ```bash
 python -m dflash.benchmark --backend mlx \
     --model Qwen/Qwen3.5-4B --draft-model z-lab/Qwen3.5-4B-DFlash \
-    --dataset gsm8k --block-size 16 --max-samples 128
+    --dataset gsm8k --max-samples 128 --enable-thinking
 ```
 
 ## Acknowledgement
