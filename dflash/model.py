@@ -51,7 +51,7 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     bsz, seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size) / temperature
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+    return torch.multinomial(probs, num_samples=1).view(bsz * seq_len)
 
 
 def _cuda_time() -> float:
