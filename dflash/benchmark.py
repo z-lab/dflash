@@ -337,7 +337,7 @@ def _run_mlx(args: argparse.Namespace) -> None:
     logger.info(f"Loading target: {args.model}")
     model, tokenizer = load(args.model)
     logger.info(f"Loading draft: {args.draft_model}")
-    draft = load_draft(args.draft_model)
+    draft = load_draft(args.draft_model, sliding_window_size=args.draft_sliding_window_size)
     block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
 
     dataset = load_and_process_dataset(args.dataset)
@@ -487,6 +487,7 @@ def main() -> None:
 
     parser.add_argument("--draft-model", type=str, default=None)
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--draft-sliding-window-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
 
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000")

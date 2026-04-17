@@ -1,5 +1,4 @@
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,8 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx_lm.generate import generation_stream
-from mlx_lm.models.cache import KVCache, can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
+from mlx_lm.models.cache import KVCache, RotatingKVCache, can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from mlx_lm.models.qwen3 import MLP
+from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -42,72 +42,22 @@ class DFlashConfig:
     num_target_layers: int
     mask_token_id: int = 0
     rope_scaling: Optional[Dict[str, Any]] = None
+    sliding_window_size: Optional[int] = None
 
 
-def _build_rope(head_dim: int, rope_theta: float, rope_scaling: Optional[Dict[str, Any]]):
-    if not rope_scaling:
-        return nn.RoPE(head_dim, traditional=False, base=rope_theta)
-    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
-    if rope_type in (None, "default"):
-        return nn.RoPE(head_dim, traditional=False, base=rope_theta)
-    if rope_type == "yarn":
-        return YarnRoPE(
-            head_dim,
-            base=rope_theta,
-            factor=float(rope_scaling["factor"]),
-            original_max_position_embeddings=int(rope_scaling["original_max_position_embeddings"]),
-            beta_fast=float(rope_scaling.get("beta_fast") or 32.0),
-            beta_slow=float(rope_scaling.get("beta_slow") or 1.0),
-            mscale=rope_scaling.get("mscale"),
-            mscale_all_dim=rope_scaling.get("mscale_all_dim"),
-        )
-    raise ValueError(f"Unsupported rope_type: {rope_type!r}")
-
-
-class YarnRoPE(nn.Module):
-    def __init__(self, dims, base, factor, original_max_position_embeddings,
-                 beta_fast=32.0, beta_slow=1.0, mscale=None, mscale_all_dim=None):
-        super().__init__()
-        self.dims = dims
-        self._freqs = self._yarn_inv_freq(
-            dims, base, factor, original_max_position_embeddings, beta_fast, beta_slow,
-        )
-        self._scale = self._attention_scaling(factor, mscale, mscale_all_dim)
-
-    @staticmethod
-    def _yarn_inv_freq(dim, base, factor, original_max_pos, beta_fast, beta_slow):
-        pos_freqs = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        inv_extra = 1.0 / pos_freqs
-        inv_inter = 1.0 / (factor * pos_freqs)
-
-        def correction_dim(num_rot):
-            return (dim * math.log(original_max_pos / (num_rot * 2 * math.pi))) / (2 * math.log(base))
-
-        low = max(math.floor(correction_dim(beta_fast)), 0)
-        high = min(math.ceil(correction_dim(beta_slow)), dim - 1)
-        if low == high:
-            high += 0.001
-
-        ramp = mx.clip((mx.arange(dim // 2, dtype=mx.float32) - low) / (high - low), 0, 1)
-        extra_factor = 1.0 - ramp
-        return inv_inter * (1.0 - extra_factor) + inv_extra * extra_factor
-
-    @staticmethod
-    def _attention_scaling(factor, mscale, mscale_all_dim):
-        def get_mscale(scale, m=1.0):
-            if scale <= 1:
-                return 1.0
-            return 0.1 * m * math.log(scale) + 1.0
-        if mscale and mscale_all_dim:
-            return float(get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim))
-        return get_mscale(factor)
-
-    def __call__(self, x, offset=0):
-        out = mx.fast.rope(
-            x, self.dims, traditional=False, base=None, scale=1.0,
-            offset=offset, freqs=self._freqs,
-        )
-        return out * self._scale if self._scale != 1.0 else out
+def _build_rope(
+    head_dim: int,
+    rope_theta: float,
+    max_position_embeddings: int,
+    rope_scaling: Optional[Dict[str, Any]],
+):
+    return initialize_rope(
+        dims=head_dim,
+        base=rope_theta,
+        traditional=False,
+        scaling_config=rope_scaling,
+        max_position_embeddings=max_position_embeddings,
+    )
 
 
 class DFlashAttention(nn.Module):
@@ -127,14 +77,22 @@ class DFlashAttention(nn.Module):
     def __call__(self, x, x_ctx, rope, cache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
-        c = mx.concatenate([x_ctx, x], axis=1)
-        queries, keys, values = self.q_proj(x), self.k_proj(c), self.v_proj(c)
+        queries = self.q_proj(x)
+        ctx_keys = self.k_proj(x_ctx)
+        ctx_values = self.v_proj(x_ctx)
+        prop_keys = self.k_proj(x)
+        prop_values = self.v_proj(x)
         queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, S + L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S + L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         queries = rope(queries, offset=cache.offset + S)
-        keys = rope(keys, offset=cache.offset)
-        keys, values = cache.update_and_fetch(keys, values)
+        ctx_keys = rope(ctx_keys, offset=cache.offset)
+        prop_keys = rope(prop_keys, offset=cache.offset + S)
+        keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
+        keys = mx.concatenate([keys, prop_keys], axis=2)
+        values = mx.concatenate([values, prop_values], axis=2)
         output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
@@ -161,7 +119,12 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rope = _build_rope(config.head_dim, config.rope_theta, config.rope_scaling)
+        self.rope = _build_rope(
+            config.head_dim,
+            config.rope_theta,
+            config.max_position_embeddings,
+            config.rope_scaling,
+        )
         self.embed_tokens = None
         self.lm_head = None
 
@@ -182,6 +145,8 @@ class DFlashDraftModel(nn.Module):
         return self
 
     def make_cache(self):
+        if self.config.sliding_window_size is not None:
+            return [RotatingKVCache(max_size=self.config.sliding_window_size, keep=0) for _ in self.layers]
         return [KVCache() for _ in self.layers]
 
     def __call__(self, inputs, target_hidden, cache):
@@ -197,7 +162,11 @@ def load(model_id: str):
     return mlx_lm_load(model_id)
 
 
-def load_draft(draft_id: str) -> DFlashDraftModel:
+def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFlashDraftModel:
+    if sliding_window_size is not None and sliding_window_size <= 0:
+        raise ValueError(
+            f"sliding_window_size must be positive or None, got {sliding_window_size}"
+        )
     path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
     cfg = json.loads((path / "config.json").read_text())
     config = DFlashConfig(
@@ -216,6 +185,7 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         num_target_layers=cfg["num_target_layers"],
         mask_token_id=cfg["dflash_config"]["mask_token_id"],
         rope_scaling=cfg.get("rope_scaling"),
+        sliding_window_size=sliding_window_size,
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
@@ -443,7 +413,10 @@ def stream_generate(
             with mx.stream(generation_stream):
                 block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
                 draft_logits = draft(block, hidden, draft_cache)
-                if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
+                if (
+                    draft.config.sliding_window_size is None and
+                    (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0
+                ):
                     trim_prompt_cache(draft_cache, trim_n)
                 draft_tokens = sampler(draft_logits[:, 1 - bs:])
             mx.async_eval(draft_tokens)
