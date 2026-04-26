@@ -1,4 +1,10 @@
 # DFlash: Block Diffusion for Flash Speculative Decoding
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![GitHub stars](https://img.shields.io/github/stars/z-lab/dflash)](https://github.com/z-lab/dflash/stargazers)
+[![GitHub last commit](https://img.shields.io/github/last-commit/z-lab/dflash)](https://github.com/z-lab/dflash/commits/main)
+[![arXiv](https://img.shields.io/badge/arXiv-2602.06036-b31b1b.svg)](https://arxiv.org/abs/2602.06036)
+
 [**Paper**](https://arxiv.org/abs/2602.06036) | [**Blog**](https://z-lab.ai/projects/dflash/) | [**Models**](https://huggingface.co/collections/z-lab/dflash)
 
 **DFlash** is a lightweight **block diffusion** model designed for speculative decoding. It enables efficient and high-quality parallel drafting.
@@ -6,6 +12,15 @@
 ![DFlash Architecture](https://raw.githubusercontent.com/jianc99/jianc99.github.io/master/images/dflash_system.png)
 
 https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
+
+## Table of Contents
+
+- [Supported Models](#supported-models)
+- [Installation](#-installation)
+- [Quick Start](#-quick-start)
+- [Evaluation](#-evaluation)
+- [Acknowledgement](#acknowledgement)
+- [Citation](#citation)
 
 ## Supported Models
 
