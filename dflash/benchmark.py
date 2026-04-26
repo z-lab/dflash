@@ -337,7 +337,12 @@ def _run_mlx(args: argparse.Namespace) -> None:
     logger.info(f"Loading target: {args.model}")
     model, tokenizer = load(args.model)
     logger.info(f"Loading draft: {args.draft_model}")
-    draft = load_draft(args.draft_model, sliding_window_size=args.draft_sliding_window_size)
+    draft = load_draft(
+        args.draft_model,
+        sliding_window_size=args.draft_sliding_window_size,
+        quantize_kv_bits=args.draft_quantize_kv_bits,
+        quantize_kv_group_size=args.draft_quantize_kv_group_size,
+    )
     block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
 
     dataset = load_and_process_dataset(args.dataset)
@@ -488,6 +493,9 @@ def main() -> None:
     parser.add_argument("--draft-model", type=str, default=None)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--draft-sliding-window-size", type=int, default=None)
+    parser.add_argument("--draft-quantize-kv-bits", type=int, default=None, choices=[4, 8],
+                        help="Quantize draft KV cache to int4/int8 (reduces memory ~4x/2x)")
+    parser.add_argument("--draft-quantize-kv-group-size", type=int, default=64)
     parser.add_argument("--max-samples", type=int, default=None)
 
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000")
