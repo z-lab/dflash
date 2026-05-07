@@ -9,7 +9,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx_lm.generate import generation_stream
-from mlx_lm.models.cache import KVCache, RotatingKVCache, can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
+from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.cache import KVCache, RotatingKVCache, can_trim_prompt_cache, make_prompt_cache
 from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.sample_utils import make_sampler
@@ -42,7 +43,9 @@ class DFlashConfig:
     num_target_layers: int
     mask_token_id: int = 0
     rope_scaling: Optional[Dict[str, Any]] = None
-    sliding_window_size: Optional[int] = None
+    layer_types: Tuple[str, ...] = field(default_factory=tuple)
+    sliding_window: Optional[int] = None
+    final_logit_softcapping: Optional[float] = None
 
 
 def _build_rope(
@@ -61,12 +64,14 @@ def _build_rope(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config: DFlashConfig):
+    def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
         self.scale = config.head_dim ** -0.5
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.sliding_window = config.sliding_window if self.is_sliding else None
         self.q_proj = nn.Linear(dim, n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
@@ -77,6 +82,13 @@ class DFlashAttention(nn.Module):
     def __call__(self, x, x_ctx, rope, cache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
+        if self.is_sliding:
+            keep_ctx = self.sliding_window - 1
+            if S > keep_ctx:
+                skip = S - keep_ctx
+                x_ctx = x_ctx[:, skip:]
+                S = x_ctx.shape[1]
+                cache.offset += skip
         queries = self.q_proj(x)
         ctx_keys = self.k_proj(x_ctx)
         ctx_values = self.v_proj(x_ctx)
@@ -91,16 +103,23 @@ class DFlashAttention(nn.Module):
         ctx_keys = rope(ctx_keys, offset=cache.offset)
         prop_keys = rope(prop_keys, offset=cache.offset + S)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
+        ctx_len = keys.shape[2]
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale)
+        mask = None
+        if self.is_sliding:
+            mask = (
+                "causal" if ctx_len + L <= self.sliding_window
+                else create_causal_mask(L, offset=ctx_len, window_size=self.sliding_window)
+            )
+        output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config: DFlashConfig):
+    def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = DFlashAttention(config)
+        self.self_attn = DFlashAttention(config, layer_idx)
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -114,10 +133,12 @@ class DFlashDraftModel(nn.Module):
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
+        if not self.config.layer_types:
+            self.config.layer_types = ("full_attention",) * self.config.num_hidden_layers
         concat_dim = len(config.target_layer_ids) * config.hidden_size
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers = [DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.layers = [DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(
             config.head_dim,
@@ -127,6 +148,7 @@ class DFlashDraftModel(nn.Module):
         )
         self.embed_tokens = None
         self.lm_head = None
+        self.embed_scale = 1.0
 
     def bind(self, target_model):
         if hasattr(target_model, "embed_tokens"):
@@ -140,21 +162,40 @@ class DFlashDraftModel(nn.Module):
         else:
             raise AttributeError(f"Cannot find embed_tokens in {type(target_model).__name__}")
         self.embed_tokens = inner.embed_tokens
+        self.embed_scale = getattr(self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0))
         lm = getattr(target_model, "language_model", target_model)
         self.lm_head = getattr(target_model, "lm_head", None) or getattr(lm, "lm_head", None) or self.embed_tokens.as_linear
         return self
 
     def make_cache(self):
-        if self.config.sliding_window_size is not None:
-            return [RotatingKVCache(max_size=self.config.sliding_window_size, keep=0) for _ in self.layers]
-        return [KVCache() for _ in self.layers]
+        caches = []
+        for layer_type in self.config.layer_types:
+            if layer_type == "sliding_attention":
+                if self.config.sliding_window is None:
+                    raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
+                caches.append(RotatingKVCache(max_size=self.config.sliding_window - 1, keep=0))
+            else:
+                caches.append(KVCache())
+        return caches
 
-    def __call__(self, inputs, target_hidden, cache):
-        h = self.embed_tokens(inputs)
+    def __call__(
+        self,
+        inputs,
+        target_hidden,
+        cache,
+        logits_start: int = 0,
+    ):
+        h = self.embed_tokens(inputs) * self.embed_scale
         h_ctx = self.hidden_norm(self.fc(target_hidden))
         for layer, c in zip(self.layers, cache):
             h = layer(h, h_ctx, self.rope, c)
-        return self.lm_head(self.norm(h))
+        if logits_start:
+            h = h[:, logits_start:]
+        logits = self.lm_head(self.norm(h))
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            logits = mx.tanh(logits / cap) * cap
+        return logits
 
 
 def load(model_id: str):
@@ -162,13 +203,17 @@ def load(model_id: str):
     return mlx_lm_load(model_id)
 
 
-def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFlashDraftModel:
-    if sliding_window_size is not None and sliding_window_size <= 0:
-        raise ValueError(
-            f"sliding_window_size must be positive or None, got {sliding_window_size}"
-        )
+def load_draft(draft_id: str) -> DFlashDraftModel:
     path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
     cfg = json.loads((path / "config.json").read_text())
+    layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
+    if len(layer_types) != cfg["num_hidden_layers"]:
+        raise ValueError("Draft config layer_types length must match num_hidden_layers.")
+    unknown_layer_types = set(layer_types) - {"full_attention", "sliding_attention"}
+    if unknown_layer_types:
+        raise ValueError(f"Unsupported draft layer_types: {sorted(unknown_layer_types)}.")
+    if "sliding_attention" in layer_types and cfg.get("sliding_window") is None:
+        raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"],
         num_hidden_layers=cfg["num_hidden_layers"],
@@ -185,7 +230,9 @@ def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFla
         num_target_layers=cfg["num_target_layers"],
         mask_token_id=cfg["dflash_config"]["mask_token_id"],
         rope_scaling=cfg.get("rope_scaling"),
-        sliding_window_size=sliding_window_size,
+        layer_types=layer_types,
+        sliding_window=cfg.get("sliding_window"),
+        final_logit_softcapping=cfg.get("final_logit_softcapping"),
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
@@ -193,12 +240,31 @@ def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFla
     return model
 
 
+def _trim_recent_cache(cache: List[Any], num_tokens: int) -> None:
+    if num_tokens <= 0:
+        return
+    for c in cache:
+        n = min(getattr(c, "offset", num_tokens), num_tokens)
+        if n <= 0:
+            continue
+        if isinstance(c, RotatingKVCache) and c.keys is not None:
+            c.keys = c._temporal_order(c.keys)
+            c.values = c._temporal_order(c.values)
+            c.keys = c.keys[..., :-n, :]
+            c.values = c.values[..., :-n, :]
+            c.offset -= n
+            c._idx = c.keys.shape[2]
+        elif hasattr(c, "trim"):
+            c.trim(n)
+
+
 class _LayerHook:
     def __init__(self, layer, idx, storage):
         self._layer, self._idx, self._storage = layer, idx, storage
 
     def __call__(self, *args, **kwargs):
-        self._storage[self._idx] = out = self._layer(*args, **kwargs)
+        out = self._layer(*args, **kwargs)
+        self._storage[self._idx] = out[0] if isinstance(out, tuple) else out
         return out
 
     def __getattr__(self, name):
@@ -344,7 +410,16 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def _make_response(text, tokens, accepted, prompt_size, prompt_tps, n, tic, finish_reason=None):
+def _make_response(
+    text,
+    tokens,
+    accepted,
+    prompt_size,
+    prompt_tps,
+    n,
+    tic,
+    finish_reason=None,
+):
     return GenerationResponse(
         text, tokens, accepted, prompt_size, prompt_tps,
         n, n / (time.perf_counter() - tic), mx.get_peak_memory() / 1e9, finish_reason,
@@ -403,7 +478,15 @@ def stream_generate(
             return
 
         detokenizer.add_token(token)
-        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic)
+        yield _make_response(
+            detokenizer.last_segment,
+            [token],
+            1,
+            prompt.size,
+            prompt_tps,
+            n,
+            tic,
+        )
 
         while n < max_tokens:
             bs = min(block_size, max_tokens - n + 1)
@@ -412,13 +495,15 @@ def stream_generate(
 
             with mx.stream(generation_stream):
                 block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
-                draft_logits = draft(block, hidden, draft_cache)
-                if (
-                    draft.config.sliding_window_size is None and
-                    (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0
-                ):
-                    trim_prompt_cache(draft_cache, trim_n)
-                draft_tokens = sampler(draft_logits[:, 1 - bs:])
+                draft_logits = draft(
+                    block,
+                    hidden,
+                    draft_cache,
+                    logits_start=1,
+                )
+                if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
+                    _trim_recent_cache(draft_cache, trim_n)
+                draft_tokens = sampler(draft_logits)
             mx.async_eval(draft_tokens)
 
             if _capture is not None:
@@ -443,7 +528,16 @@ def stream_generate(
                 detokenizer.finalize()
                 tokens.extend(new_tokens)
                 n += len(new_tokens)
-                yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic, "stop")
+                yield _make_response(
+                    detokenizer.last_segment,
+                    new_tokens,
+                    accepted + 1,
+                    prompt.size,
+                    prompt_tps,
+                    n,
+                    tic,
+                    "stop",
+                )
                 return
 
             for t in new_tokens:
@@ -454,18 +548,35 @@ def stream_generate(
             if n % 256 == 0:
                 mx.clear_cache()
 
-            yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic)
+            yield _make_response(
+                detokenizer.last_segment,
+                new_tokens,
+                accepted + 1,
+                prompt.size,
+                prompt_tps,
+                n,
+                tic,
+            )
 
             trim = bs - accepted - 1
             if trim > 0:
                 if _target_can_trim:
-                    trim_prompt_cache(target_cache, trim)
+                    _trim_recent_cache(target_cache, trim)
                 elif _capture is not None:
                     _capture.rollback(target_cache, accepted, trim)
             hidden = hidden[:, :accepted + 1, :]
 
         detokenizer.finalize()
-        yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length")
+        yield _make_response(
+            detokenizer.last_segment,
+            [],
+            0,
+            prompt.size,
+            prompt_tps,
+            n,
+            tic,
+            "length",
+        )
     finally:
         if _capture is not None:
             _capture.close()

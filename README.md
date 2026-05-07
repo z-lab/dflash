@@ -11,14 +11,17 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 | Model | DFlash Draft |
 |---|---|
-| Qwen3.5-122B-A10B | [z-lab/Qwen3.5-122B-A10B-DFlash](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) |
-| Qwen3.6-27B (Preview) | [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) |
+| gemma-4-26B-A4B-it | [z-lab/gemma-4-26B-A4B-it-DFlash](https://huggingface.co/z-lab/gemma-4-26B-A4B-it-DFlash) |
+| gemma-4-31B-it | [z-lab/gemma-4-31B-it-DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) |
+| Qwen3.6-27B | [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) |
 | Qwen3.6-35B-A3B | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
+| MiniMax-M2.5 (Preview) | [z-lab/MiniMax-M2.5-DFlash](https://huggingface.co/z-lab/MiniMax-M2.5-DFlash) |
 | Kimi-K2.5 | [z-lab/Kimi-K2.5-DFlash](https://huggingface.co/z-lab/Kimi-K2.5-DFlash) |
 | Qwen3.5-4B | [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) |
 | Qwen3.5-9B | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) |
 | Qwen3.5-27B | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) |
 | Qwen3.5-35B-A3B | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) |
+| Qwen3.5-122B-A10B | [z-lab/Qwen3.5-122B-A10B-DFlash](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) |
 | Qwen3-Coder-Next | [z-lab/Qwen3-Coder-Next-DFlash](https://huggingface.co/z-lab/Qwen3-Coder-Next-DFlash) |
 | Qwen3-Coder-30B-A3B | [z-lab/Qwen3-Coder-30B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3-Coder-30B-A3B-DFlash) |
 | gpt-oss-20b | [z-lab/gpt-oss-20b-DFlash](https://huggingface.co/z-lab/gpt-oss-20b-DFlash) |
@@ -29,6 +32,9 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 | Gemma-4-31B-it | [z-lab/gemma-4-31B-it-DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) |
 | Gemma-4-26B-A4B-it | [z-lab/gemma-4-26B-A4B-it-DFlash](https://huggingface.co/z-lab/gemma-4-26B-A4B-it-DFlash) |
 | Qwen3.5-397B-A17B | Coming soon |
+| DeepSeek-V4-Flash | Coming soon |
+| DeepSeek-V4-Pro | Coming soon |
+| MiniMax-M2.7 | Coming soon |
 | GLM-5.1 | Coming soon |
 
 > Feel free to open a GitHub issue to request support for additional models. We will also open-source the training recipe soon, so you can train your own DFlash draft model to accelerate any LLM.
@@ -44,16 +50,51 @@ Use a separate virtual environment for each to avoid conflict.
 | **vLLM** | See below |
 | **MLX** (Apple Silicon) | `pip install -e ".[mlx]"` |
 
-**vLLM:** (We temporarily modify the installation through this PR to support interleaved SWA and ensure correct handling of target hidden states for optimal performance):
+**vLLM:** vLLM v0.20.1+ includes core DFlash support. Use the standard install for most models:
 ```bash
 uv pip install -e ".[vllm]"
-uv pip install -U --torch-backend=auto "vllm @ git+https://github.com/vllm-project/vllm.git@refs/pull/40898/head"
+```
+
+Gemma4 DFlash currently needs our temporary vLLM Gemma4 build. Docker is recommended:
+```bash
+docker pull ghcr.io/z-lab/vllm-openai:gemma4-dflash-cu130
+```
+
+Source fallback for Gemma4:
+```bash
+uv pip install -U --torch-backend=auto \
+  "vllm @ git+https://github.com/vllm-project/vllm.git@refs/pull/41703/head"
+```
+
+Newer non-Gemma4 SWA draft models use the SWA support branch:
+```bash
+uv pip install -U --torch-backend=auto \
+  "vllm @ git+https://github.com/vllm-project/vllm.git@refs/pull/40898/head"
 ```
 
 ## 🚀 Quick Start
 
 ### vLLM
 
+Gemma4 with Docker:
+```bash
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --shm-size=16g \
+  -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/z-lab/vllm-openai:gemma4-dflash-cu130 \
+  google/gemma-4-26B-A4B-it \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --speculative-config '{"method": "dflash", "model": "z-lab/gemma-4-26B-A4B-it-DFlash", "num_speculative_tokens": 15, "attention_backend": "flash_attn"}' \
+  --attention-backend triton_attn \
+  --max-num-batched-tokens 32768 \
+  --trust-remote-code
+```
+
+Non-Gemma4 models:
 ```bash
 vllm serve Qwen/Qwen3.5-27B \
   --speculative-config '{"method": "dflash", "model": "z-lab/Qwen3.5-27B-DFlash", "num_speculative_tokens": 15}' \
@@ -104,14 +145,13 @@ print(tokenizer.decode(output[0], skip_special_tokens=False))
 
 ### MLX (Apple Silicon)
 
-There have been many great community DFlash implementations on MLX; we provide a simple and efficient one here, tested on an Apple M5 Pro with Qwen3 and Qwen3.5 models.
+There have been many great community DFlash implementations on MLX; we provide a simple and efficient one here, tested on an Apple M5 Pro with Qwen3, Qwen3.5 and Gemma-4 models.
 
 ```python
 from dflash.model_mlx import load, load_draft, stream_generate
 
 model, tokenizer = load("Qwen/Qwen3.5-4B")
-# Experimental: bound the committed draft KV history to a sliding window.
-draft = load_draft("z-lab/Qwen3.5-4B-DFlash", sliding_window_size=None)
+draft = load_draft("z-lab/Qwen3.5-4B-DFlash")
 
 messages = [{"role": "user", "content": "How many positive whole-number divisors does 196 have?"}]
 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
@@ -121,10 +161,6 @@ for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tok
     tps = r.generation_tps
 print(f"\nThroughput: {tps:.2f} tok/s")
 ```
-
-For ultra-long-context or agentic use cases, consider trying the experimental
-`sliding_window_size` / `--draft-sliding-window-size` option to bound draft KV
-growth.
 
 ## 📊 Evaluation
 
@@ -154,9 +190,8 @@ torchrun --nproc_per_node=8 -m dflash.benchmark --backend transformers \
 **MLX**:
 ```bash
 python -m dflash.benchmark --backend mlx \
-    --model Qwen/Qwen3.5-4B --draft-model z-lab/Qwen3.5-4B-DFlash \
-    --dataset gsm8k --max-samples 128 --enable-thinking \
-    --draft-sliding-window-size 4096
+    --model mlx-community/gemma-4-31b-it-4bit --draft-model z-lab/gemma-4-31B-it-DFlash \
+    --dataset gsm8k --max-samples 128 --enable-thinking
 ```
 
 ## Acknowledgement

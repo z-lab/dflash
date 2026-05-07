@@ -33,6 +33,6 @@ vllm = [
     "huggingface-hub<1",
 ]
 mlx = [
-    "mlx",
-    "mlx-lm>=0.31.2",
+    "mlx==0.31.2",
+    "mlx-lm==0.31.3",
 ]
