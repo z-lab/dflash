@@ -36,3 +36,8 @@ mlx = [
     "mlx==0.31.2",
     "mlx-lm==0.31.3",
 ]
+test = [
+    "pytest>=8",
+    "torch",
+    "transformers==4.57.1",
+]
