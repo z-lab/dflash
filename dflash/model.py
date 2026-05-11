@@ -104,6 +104,11 @@ def dflash_generate(
     start = num_input_tokens
     draft_prefill = True
 
+    stop_token_tensor = (
+        torch.as_tensor(stop_token_ids, device=output_ids.device, dtype=output_ids.dtype)
+        if stop_token_ids is not None else None
+    )
+
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
@@ -142,15 +147,16 @@ def dflash_generate(
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
 
-        if stop_token_ids is not None and any(
-            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-        ):
+        if stop_token_tensor is not None and torch.isin(
+            output_ids[0, num_input_tokens : start + 1], stop_token_tensor
+        ).any().item():
             break
 
     output_ids = output_ids[:, :min(start + 1, max_length)]
-    if stop_token_ids is not None:
-        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
+    if stop_token_tensor is not None:
+        stop_token_indices = torch.isin(
+            output_ids[0][num_input_tokens:], stop_token_tensor
+        ).nonzero(as_tuple=True)[0]
         if stop_token_indices.numel() > 0:
             output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
 
