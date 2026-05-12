@@ -1,0 +1,14 @@
+# Optional model backends require torch/transformers or MLX packages that are
+# not installed in this unit-test runtime; lightweight tests cover import-safe
+# package and benchmark behavior.
+[run]
+source = dflash
+omit =
+    dflash/model.py
+    dflash/model_mlx.py
+
+[report]
+exclude_also =
+    if __name__ == .__main__.:
+    def _run_transformers
+    def _run_mlx
