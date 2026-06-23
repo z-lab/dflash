@@ -164,6 +164,8 @@ print(f"\nThroughput: {tps:.2f} tok/s")
 
 All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench). Datasets are automatically downloaded and cached as JSONL in `cache/` on first run.
 
+Benchmark over a steady request window, not the first requests after launch. The DFlash draft path needs a few requests to warm up; cold readings can undersell steady-state throughput by a large margin (see #135). The harness warms up automatically (`--num-warmup`, default 8); raise it on slower/larger setups.
+
 **vLLM**:
 ```bash
 python -m dflash.benchmark --backend vllm \
