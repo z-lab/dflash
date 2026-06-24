@@ -160,6 +160,18 @@ for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tok
 print(f"\nThroughput: {tps:.2f} tok/s")
 ```
 
+### openinfer (Rust)
+
+[openinfer](https://github.com/openinfer-project/openinfer) is a pure Rust + CUDA inference engine (no PyTorch) with native DFlash support for Qwen3-4B / 8B, using the [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) and [`z-lab/Qwen3-8B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) drafters.
+
+```bash
+cargo run --release -- \
+  --model-path models/Qwen3-4B \
+  --dflash-draft-model-path models/Qwen3-4B-DFlash-b16
+```
+
+Single-stream decode speedup: **1.82× on RTX 5070 Ti**, **1.56× on RTX 5090**.
+
 ## 📊 Evaluation
 
 All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench). Datasets are automatically downloaded and cached as JSONL in `cache/` on first run.
