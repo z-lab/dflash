@@ -120,7 +120,6 @@ class DFlashConfig:
     max_position_embeddings: int
     block_size: int
     target_layer_ids: tuple[int, ...]
-    num_target_layers: int
     mask_token_id: int = 0
     rope_scaling: dict[str, Any] | None = None
     layer_types: tuple[str, ...] = field(default_factory=tuple)
@@ -453,7 +452,6 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         max_position_embeddings=cfg["max_position_embeddings"],
         block_size=int(dflash.get("block_size", cfg.get("block_size", 16))),
         target_layer_ids=tuple(dflash["target_layer_ids"]),
-        num_target_layers=cfg["num_target_layers"],
         mask_token_id=dflash["mask_token_id"],
         rope_scaling=rope,
         layer_types=layer_types,
