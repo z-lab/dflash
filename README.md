@@ -1,5 +1,7 @@
 # DFlash: Block Diffusion for Flash Speculative Decoding
 
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
 **DFlash** is a lightweight **block diffusion** model designed for speculative decoding. It enables efficient and high-quality parallel drafting.
 
 <details open>
