@@ -95,6 +95,38 @@ dflash generate openai \
     "How many positive whole-number divisors does 196 have?"
 ```
 
+#### NVIDIA Jetson AGX Thor
+
+Server startup and generation with Qwen3.8-27B DFlash 2 were tested on a
+128 GB Jetson AGX Thor Developer Kit (`sm_110a`, Ubuntu 24.04, Linux aarch64)
+with vLLM commit `b389ac29465b33f9e9c534df221ea3c129e9793f`, NVIDIA PyTorch
+`2.13.0a0+9186a08b2c.nv26.07`, FlashInfer `0.6.17`, and CUDA 13.3-built
+kernels. The target used compressed-tensors NVFP4 weights and an FP8 E4M3 KV
+cache. The tested run used explicit V2 and FlashInfer architecture overrides:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=1
+export FLASHINFER_CUDA_ARCH_LIST=11.0a
+
+vllm serve /path/to/Qwen3.8-27B-NVFP4 \
+    --served-model-name Qwen/Qwen3.8-27B \
+    --max-model-len 262144 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.30 \
+    --kv-cache-memory-bytes 21474836480 \
+    --speculative-config \
+      '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
+```
+
+The explicit 20 GiB allocation makes vLLM skip automatic KV-cache memory
+sizing; model warmup and compilation still run. In the tested vLLM revision,
+`--gpu-memory-utilization 0.30` remained relevant to the startup free-memory
+check but did not size the KV cache. With the tested target, vLLM reported
+453,669 tokens of KV capacity (1.73 sequences at the 262,144-token limit).
+Capacity depends on the target architecture and KV-cache dtype, so verify the
+reported cache size and tune both memory values for the workloads sharing the
+device.
+
 ## 📊 Evaluation
 
 All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench), downloaded and cached by Hugging Face Datasets.
