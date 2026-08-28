@@ -22,18 +22,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
 # Model utilities
 # ---------------------------------------------------------------------------
 
-def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
-    if num_draft_layers == 1:
-        return [num_target_layers // 2]
-    start = 1
-    end = num_target_layers - 3
-    span = end - start
-    return [
-        round(start + (i * span) / (num_draft_layers - 1))
-        for i in range(num_draft_layers)
-    ]
-
-
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: list[int] | None,
@@ -557,11 +545,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.target_layer_ids = _draft_value(
-            config,
-            "target_layer_ids",
-            build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
-        )
+        self.target_layer_ids = _draft_value(config, "target_layer_ids")
+        if self.target_layer_ids is None:
+            raise ValueError("Draft config must define dflash_config.target_layer_ids.")
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
