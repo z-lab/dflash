@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import mlx_lm.models.gated_delta as _gd_mod
@@ -120,7 +120,7 @@ class DFlashConfig:
     max_position_embeddings: int
     block_size: int
     target_layer_ids: tuple[int, ...]
-    num_target_layers: int
+    num_target_layers: int | None = None
     mask_token_id: int = 0
     rope_scaling: dict[str, Any] | None = None
     layer_types: tuple[str, ...] = field(default_factory=tuple)
@@ -366,6 +366,17 @@ class DFlashDraftModel(nn.Module):
         )
         lm = getattr(target_model, "language_model", target_model)
         self.lm_head = getattr(target_model, "lm_head", None) or getattr(lm, "lm_head", None) or self.embed_tokens.as_linear
+        # A draft config left at its structural defaults (multiplier 1.0, no softcap,
+        # as with Meta's v1 head) inherits the target's logit scale when the target
+        # has one (Glimmer does, Qwen targets don't) so draft probs land on the
+        # target's scale for rejection sampling. Greedy argmax is unaffected either way.
+        if self.config.output_multiplier == 1.0 and self.config.final_logit_softcapping is None:
+            target_args = getattr(target_model, "args", None)
+            if target_args is not None and hasattr(target_args, "output_multiplier"):
+                self.config.output_multiplier = target_args.output_multiplier
+                self.config.final_logit_softcapping = getattr(
+                    target_args, "final_logit_softcapping", None
+                )
         return self
 
     def make_cache(self):
@@ -427,37 +438,21 @@ def load(model_id: str):
     return mlx_lm_load(model_id)
 
 
-def load_draft(draft_id: str) -> DFlashDraftModel:
-    path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
-    cfg = json.loads((path / "config.json").read_text())
+@dataclass
+class _DraftAdapter:
+    model_class: type
+    config_kwargs: Callable[[dict], dict]
+    remap_weights: Callable[[dict, dict], dict]
+
+
+def _dflash2_config_kwargs(cfg: dict) -> dict:
     dflash = cfg.get("dflash_config", {})
-    rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
-    layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
-    if len(layer_types) != cfg["num_hidden_layers"]:
-        raise ValueError("Draft config layer_types length must match num_hidden_layers.")
-    unknown_layer_types = set(layer_types) - {"full_attention", "sliding_attention"}
-    if unknown_layer_types:
-        raise ValueError(f"Unsupported draft layer_types: {sorted(unknown_layer_types)}.")
-    if "sliding_attention" in layer_types and cfg.get("sliding_window") is None:
-        raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
-    config = DFlashConfig(
-        hidden_size=cfg["hidden_size"],
-        num_hidden_layers=cfg["num_hidden_layers"],
-        num_attention_heads=cfg["num_attention_heads"],
-        num_key_value_heads=cfg["num_key_value_heads"],
-        head_dim=cfg["head_dim"],
-        intermediate_size=cfg["intermediate_size"],
+    return dict(
         vocab_size=cfg["vocab_size"],
-        rms_norm_eps=cfg["rms_norm_eps"],
-        rope_theta=cfg.get("rope_theta", (rope or {}).get("rope_theta", 10000.0)),
-        max_position_embeddings=cfg["max_position_embeddings"],
         block_size=int(dflash.get("block_size", cfg.get("block_size", 16))),
         target_layer_ids=tuple(dflash["target_layer_ids"]),
-        num_target_layers=cfg["num_target_layers"],
+        num_target_layers=cfg.get("num_target_layers"),
         mask_token_id=dflash["mask_token_id"],
-        rope_scaling=rope,
-        layer_types=layer_types,
-        sliding_window=cfg.get("sliding_window"),
         final_logit_softcapping=dflash.get(
             "final_logit_softcapping", cfg.get("final_logit_softcapping")
         ),
@@ -469,17 +464,105 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         selector_top_k=int(dflash.get("selector_top_k", 0)),
         is_causal=cfg.get("is_causal"),
     )
-    weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
-    model_class = (
-        DFlash2DraftModel
-        if "DFlash2DraftModel" in (cfg.get("architectures") or [])
-        else DFlashDraftModel
+
+
+def _meta_v1_config_kwargs(cfg: dict) -> dict:
+    return dict(
+        vocab_size=cfg.get("vocab_size", 202048),
+        block_size=int(cfg.get("block_size", 16)),
+        target_layer_ids=tuple(cfg["target_layer_ids"]),
+        num_target_layers=None,
+        mask_token_id=cfg["mask_token_id"],
+        final_logit_softcapping=cfg.get("final_logit_softcapping"),
+        input_embedding_scale=float(cfg.get("input_embedding_scale", 1.0)),
+        output_multiplier=float(cfg.get("output_multiplier", 1.0)),
+        # vLLM's dflash_config sets causal=False for this head: in-block attention
+        # is bidirectional, unlike the sliding-causal default the layer_types imply.
+        is_causal=False,
     )
-    if model_class is DFlash2DraftModel:
-        for name in ("predecessor_codebook", "successor_codebook"):
-            key = f"candidate_selector.{name}"
-            weights[f"{key}.weight"] = weights.pop(key)
-    model = model_class(config)
+
+
+def _remap_dflash2_weights(cfg: dict, weights: dict) -> dict:
+    weights = dict(weights)
+    for name in ("predecessor_codebook", "successor_codebook"):
+        key = f"candidate_selector.{name}"
+        weights[f"{key}.weight"] = weights.pop(key)
+    return weights
+
+
+def _remap_meta_v1_weights(cfg: dict, weights: dict) -> dict:
+    prefixes = {"encoder.fc.": "fc.", "encoder.output_norm_enc.": "hidden_norm."}
+    out = {}
+    for k, v in weights.items():
+        for old, new in prefixes.items():
+            if k.startswith(old):
+                k = new + k[len(old):]
+                break
+        out[k] = v
+    return out
+
+
+_DRAFT_ADAPTERS: dict[str, _DraftAdapter] = {
+    "DFlash2DraftModel": _DraftAdapter(
+        DFlash2DraftModel, _dflash2_config_kwargs, _remap_dflash2_weights
+    ),
+    "MuseGlimmerAssistantModel": _DraftAdapter(
+        DFlashDraftModel, _meta_v1_config_kwargs, _remap_meta_v1_weights
+    ),
+}
+
+
+def _draft_adapter(cfg: dict) -> _DraftAdapter:
+    architecture = (cfg.get("architectures") or [None])[0]
+    adapter = _DRAFT_ADAPTERS.get(architecture)
+    if adapter is None:
+        raise ValueError(f"Unsupported draft architecture: {architecture!r}")
+    return adapter
+
+
+def _draft_model_class(cfg: dict) -> type:
+    return _draft_adapter(cfg).model_class
+
+
+def _draft_config(cfg: dict) -> DFlashConfig:
+    layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
+    if len(layer_types) != cfg["num_hidden_layers"]:
+        raise ValueError("Draft config layer_types length must match num_hidden_layers.")
+    unknown_layer_types = set(layer_types) - {"full_attention", "sliding_attention"}
+    if unknown_layer_types:
+        raise ValueError(f"Unsupported draft layer_types: {sorted(unknown_layer_types)}.")
+    if "sliding_attention" in layer_types and cfg.get("sliding_window") is None:
+        raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
+
+    rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
+    return DFlashConfig(
+        hidden_size=cfg["hidden_size"],
+        num_hidden_layers=cfg["num_hidden_layers"],
+        num_attention_heads=cfg["num_attention_heads"],
+        num_key_value_heads=cfg["num_key_value_heads"],
+        head_dim=cfg["head_dim"],
+        intermediate_size=cfg["intermediate_size"],
+        rms_norm_eps=cfg["rms_norm_eps"],
+        rope_theta=cfg.get("rope_theta", (rope or {}).get("rope_theta", 10000.0)),
+        max_position_embeddings=cfg["max_position_embeddings"],
+        rope_scaling=rope,
+        layer_types=layer_types,
+        sliding_window=cfg.get("sliding_window"),
+        **_draft_adapter(cfg).config_kwargs(cfg),
+    )
+
+
+def _remap_draft_weights(cfg: dict, weights: dict) -> dict:
+    return _draft_adapter(cfg).remap_weights(cfg, weights)
+
+
+def load_draft(draft_id: str) -> DFlashDraftModel:
+    path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
+    cfg = json.loads((path / "config.json").read_text())
+    config = _draft_config(cfg)
+    weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
+    weights = _remap_draft_weights(cfg, weights)
+    model = _draft_model_class(cfg)(config)
     model.eval()
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())
