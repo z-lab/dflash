@@ -806,10 +806,17 @@ def _stream_generate(
                 else:
                     draft_logits = draft(block, hidden, draft_cache, logits_start=1)
                     if temperature > 0:
-                        draft_probs = _sampling_probs(
-                            draft_logits, temperature, top_p, top_k
+                        # v1 block positions are independent marginals, so sampling
+                        # each one separately yields an incoherent sequence the
+                        # target rejects almost everything; propose argmax instead
+                        # and rejection-sample against a one-hot proposal.
+                        draft_tokens = mx.argmax(draft_logits, axis=-1)
+                        draft_probs = mx.put_along_axis(
+                            mx.zeros(draft_logits.shape, dtype=mx.float32),
+                            draft_tokens[..., None],
+                            mx.ones(draft_tokens[..., None].shape, dtype=mx.float32),
+                            axis=-1,
                         )
-                        draft_tokens = _sample_probs(draft_probs)
                         draft_indices = None
                     else:
                         draft_tokens = mx.argmax(draft_logits, axis=-1)
