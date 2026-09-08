@@ -71,9 +71,12 @@ dflash generate transformers \
 
 ### MLX (Apple Silicon)
 
-The MLX backend supports DFlash 2 for Qwen3.8-27B, and DFlash for Qwen3,
-Qwen3.5, Qwen3.6, and Gemma 4. Qwen3.8 uses `reasoning_effort`: `low`, `medium`,
-or `xhigh` (default). For quantized targets or drafts, use `block_size <= 5`: MLX's current
+The MLX backend supports DFlash 2 for Qwen3.8-27B and Muse-Glimmer-30B, and DFlash
+for Qwen3, Qwen3.5, Qwen3.6, Gemma 4, and Muse-Glimmer-30B (Meta's
+[`Muse-Glimmer-30B-assistant`](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant)
+head loads as published). Qwen3.8 uses `reasoning_effort`: `low`, `medium`,
+or `xhigh` (default); Muse uses `reasoning_strength` as in the Transformers example.
+For quantized targets or drafts, use `block_size <= 5`: MLX's current
 quantized matmul kernel becomes less efficient at larger verify widths.
 The example below runs both the target and draft with 4-bit weights.
 
@@ -84,6 +87,21 @@ dflash generate mlx \
     --draft-bits 4 --block-size 5 --reasoning xhigh \
     "How many positive whole-number divisors does 196 have?"
 ```
+
+Muse-Glimmer-30B with Meta's DFlash head (or `--draft z-lab/Muse-Glimmer-30B-DFlash2`):
+
+```bash
+dflash generate mlx \
+    --model mlx-community/Muse-Glimmer-30B-4bit \
+    --draft meta-models/Muse-Glimmer-30B-assistant \
+    --draft-bits 4 --block-size 5 --reasoning low \
+    "How many positive whole-number divisors does 196 have?"
+```
+
+Measured on an M3 Ultra with the 4-bit target, greedy, 6 prompts x 256 tokens
+(`python -m dflash.bench_mlx`): no draft 40.7 tok/s; Meta head (4-bit) block 5 47.6 tok/s
+(1.17x, 2.9 accepted/step); DFlash 2 head (4-bit) block 5 50.8 tok/s (1.25x, 3.4 accepted/step).
+Block 16 is slower than no draft on this target (0.80x), consistent with the note above.
 
 ### OpenAI-compatible server
 
