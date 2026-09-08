@@ -1,0 +1,8 @@
+[
+  "What year did the Berlin Wall fall?",
+  "Write a Python function that returns the k most frequent elements in a list, and explain its time complexity.",
+  "Write a 300-word essay on why tide pools are a good model system for studying climate change.",
+  "A train leaves Station A at 60 mph heading toward Station B, 210 miles away. A second train leaves Station B at the same time heading toward Station A at 90 mph. How long until they meet?",
+  "Extract the fields from this order into JSON with keys order_id, customer, items (list of {name, qty}), and total: \"Order #4471 for Priya Nair: 2x wireless mouse, 1x USB-C hub. Total $58.40.\"",
+  "请用中文解释什么是推理模型，并给出一个日常生活中的例子。"
+]
