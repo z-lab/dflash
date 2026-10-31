@@ -38,6 +38,15 @@ def _parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--max-samples", type=int)
     benchmark.add_argument("--num-prompts", type=int, default=1024)
     benchmark.add_argument("--concurrency", type=int, default=1)
+    benchmark.add_argument(
+        "--num-warmup",
+        type=int,
+        default=8,
+        help=(
+            "Warmup requests sent before timing (openai backend). The draft path "
+            "needs several requests to reach steady state."
+        ),
+    )
     return parser
 
 

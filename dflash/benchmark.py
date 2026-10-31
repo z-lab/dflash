@@ -356,8 +356,9 @@ def _run_mlx(args: argparse.Namespace) -> None:
 
 def _run_openai(args: argparse.Namespace) -> None:
     bs = max(args.concurrency, 1)
+    warmup_n = 0 if args.num_warmup == 0 else max(args.num_warmup, bs)
     dataset = _select_dataset(
-        load_and_process_dataset(args.dataset), args.num_prompts + bs, repeat=True,
+        load_and_process_dataset(args.dataset), args.num_prompts + warmup_n, repeat=True,
     )
     prompts = [
         [{"role": "user", "content": item["turns"][0]}]
@@ -381,9 +382,10 @@ def _run_openai(args: argparse.Namespace) -> None:
             reasoning=args.reasoning,
         )
 
-    print(f"[warmup] {bs} requests ...")
-    with ThreadPoolExecutor(max_workers=bs) as pool:
-        list(pool.map(lambda p: send_one(p, min(64, args.max_new_tokens)), warmup_prompts))
+    if warmup_n > 0:
+        print(f"[warmup] {warmup_n} requests ...")
+        with ThreadPoolExecutor(max_workers=bs) as pool:
+            list(pool.map(lambda p: send_one(p, min(64, args.max_new_tokens)), warmup_prompts))
 
     print(f"Running benchmark: {args.num_prompts} prompts, concurrency={bs} ...")
     start = time.perf_counter()
