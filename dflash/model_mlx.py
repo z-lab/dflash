@@ -3,27 +3,107 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
+import mlx_lm.models.gated_delta as _gd_mod
 from huggingface_hub import snapshot_download
-from mlx_lm.generate import generation_stream
+from mlx import nn
+from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.base import create_causal_mask
-from mlx_lm.models.cache import KVCache, RotatingKVCache, can_trim_prompt_cache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    RotatingKVCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+)
 from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-try:
-    import mlx_lm.models.gated_delta as _gd_mod
-    _HAS_GDN = True
-except ImportError:
-    _HAS_GDN = False
-
-
 _GDN_PATCH_LOCK = RLock()
+
+
+def _sampling_probs(logits, temperature, top_p=1.0, top_k=0):
+    scores = logits.astype(mx.float32) / temperature
+    vocab_size = scores.shape[-1]
+    if 0 < top_k < vocab_size:
+        indices = mx.argpartition(-scores, top_k - 1, axis=-1)[..., :top_k]
+        scores = mx.take_along_axis(scores, indices, axis=-1)
+    else:
+        indices = None
+
+    probs = mx.softmax(scores, axis=-1)
+    if top_p < 1.0:
+        order = mx.argsort(-probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, order, axis=-1)
+        keep = mx.cumsum(sorted_probs, axis=-1) - sorted_probs < top_p
+        sorted_probs = mx.where(keep, sorted_probs, 0)
+        probs = mx.put_along_axis(mx.zeros_like(probs), order, sorted_probs, axis=-1)
+        probs = probs / mx.sum(probs, axis=-1, keepdims=True)
+
+    if indices is not None:
+        probs = mx.put_along_axis(
+            mx.zeros(logits.shape, dtype=probs.dtype), indices, probs, axis=-1
+        )
+    return probs
+
+
+def _sample_probs(probs):
+    return mx.random.categorical(mx.log(probs))
+
+
+def _sample_logits(logits, temperature=0.0, top_p=1.0, top_k=0):
+    if temperature <= 0:
+        return mx.argmax(logits, axis=-1)
+    return _sample_probs(_sampling_probs(logits, temperature, top_p, top_k))
+
+
+def make_sampler(temperature=0.0, top_p=1.0, top_k=0):
+    if temperature < 0 or not 0 < top_p <= 1 or top_k < 0:
+        raise ValueError("temperature and top_k must be non-negative, and top_p in (0, 1].")
+    return lambda logits: _sample_logits(logits, temperature, top_p, top_k)
+
+
+def _rejection_sample(draft_tokens, target_probs, draft_probs, draft_indices=None):
+    gamma = draft_tokens.shape[1]
+    p = mx.take_along_axis(
+        target_probs[:, :gamma], draft_tokens[..., None], axis=-1
+    )[..., 0]
+    if draft_indices is None:
+        q = mx.take_along_axis(
+            draft_probs, draft_tokens[..., None], axis=-1
+        )[..., 0]
+    else:
+        q = mx.sum(
+            draft_probs * (draft_indices == draft_tokens[..., None]), axis=-1
+        )
+    accepted = mx.sum(
+        mx.cumprod(
+            (mx.random.uniform(shape=q.shape) * q < p).astype(mx.int32), axis=-1
+        ),
+        axis=-1,
+    )[0].item()
+    if accepted == gamma:
+        return accepted, _sample_probs(target_probs[:, -1])[0].item()
+
+    residual = target_probs[0, accepted]
+    if draft_indices is None:
+        residual = residual - draft_probs[0, accepted]
+    else:
+        indices = draft_indices[0, accepted]
+        values = mx.take(residual, indices) - draft_probs[0, accepted]
+        residual = mx.put_along_axis(
+            residual[None], indices[None], values[None], axis=-1
+        )[0]
+    residual = mx.maximum(residual, 0)
+    total = mx.sum(residual)
+    residual = mx.where(
+        total > 0,
+        residual / mx.maximum(total, 1e-30),
+        target_probs[0, accepted],
+    )
+    return accepted, _sample_probs(residual[None])[0].item()
 
 
 @dataclass
@@ -39,20 +119,27 @@ class DFlashConfig:
     rope_theta: float
     max_position_embeddings: int
     block_size: int
-    target_layer_ids: Tuple[int, ...]
+    target_layer_ids: tuple[int, ...]
     num_target_layers: int
     mask_token_id: int = 0
-    rope_scaling: Optional[Dict[str, Any]] = None
-    layer_types: Tuple[str, ...] = field(default_factory=tuple)
-    sliding_window: Optional[int] = None
-    final_logit_softcapping: Optional[float] = None
+    rope_scaling: dict[str, Any] | None = None
+    layer_types: tuple[str, ...] = field(default_factory=tuple)
+    sliding_window: int | None = None
+    final_logit_softcapping: float | None = None
+    input_embedding_scale: float = 1.0
+    output_multiplier: float = 1.0
+    conv_kernel_size: int = 0
+    conv_group_size: int = 0
+    selector_rank: int = 0
+    selector_top_k: int = 0
+    is_causal: bool | None = None
 
 
 def _build_rope(
     head_dim: int,
     rope_theta: float,
     max_position_embeddings: int,
-    rope_scaling: Optional[Dict[str, Any]],
+    rope_scaling: dict[str, Any] | None,
 ):
     return initialize_rope(
         dims=head_dim,
@@ -72,6 +159,7 @@ class DFlashAttention(nn.Module):
         self.scale = config.head_dim ** -0.5
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.is_causal = self.is_sliding if config.is_causal is None else config.is_causal
         self.q_proj = nn.Linear(dim, n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
@@ -106,12 +194,15 @@ class DFlashAttention(nn.Module):
         ctx_len = keys.shape[2]
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        mask = None
+        mask = create_causal_mask(L, offset=ctx_len) if self.is_causal else None
         if self.is_sliding:
-            mask = (
-                "causal" if ctx_len + L <= self.sliding_window
-                else create_causal_mask(L, offset=ctx_len, window_size=self.sliding_window)
-            )
+            query = ctx_len + mx.arange(L)[:, None]
+            key = mx.arange(ctx_len + L)[None]
+            context = (key < ctx_len) & (query - key < self.sliding_window)
+            block = key >= ctx_len
+            if self.is_causal:
+                block = block & (key <= query)
+            mask = context | block
         output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
@@ -129,7 +220,114 @@ class DFlashDecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
+    batch, length, hidden_size = hidden.shape
+    groups = hidden_size // group_size
+    blocks = hidden.reshape(batch, length, groups, group_size)
+    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+    output = mx.zeros_like(blocks)
+    for offset in range(base.shape[0]):
+        values = blocks if offset == 0 else mx.concatenate(
+            (mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]), axis=1
+        )
+        kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+        output = output + kernel * values
+        output = output + dynamic[:, :, offset] * values
+    return output.reshape(hidden.shape)
+
+
+class GroupedDynamicCausalConv(nn.Module):
+    def __init__(self, hidden_size, kernel_size, group_size):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.group_size = group_size
+        groups = hidden_size // group_size
+        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
+        self.kernel_projection = nn.Linear(
+            hidden_size, 2 * kernel_size * groups, bias=False
+        )
+
+    def prepare(self, hidden):
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(
+            *hidden.shape[:-1], 2, self.kernel_size, groups
+        )
+        return (
+            _grouped_dynamic_convolve(
+                hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size
+            ),
+            dynamic[..., 1, :, :],
+        )
+
+    def finish(self, hidden, dynamic):
+        return _grouped_dynamic_convolve(
+            hidden, dynamic, self.base_kernel[1], self.group_size
+        )
+
+
+class DFlash2DecoderLayer(DFlashDecoderLayer):
+    def __init__(self, config: DFlashConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.attention_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+        self.mlp_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+
+    def __call__(self, x, x_ctx, rope, cache):
+        residual = x
+        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
+        x = residual + self.attention_conv.finish(
+            self.self_attn(x, x_ctx, rope, cache), kernel
+        )
+        residual = x
+        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
+        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
+
+
+class CandidateSelector(nn.Module):
+    def __init__(self, config: DFlashConfig):
+        super().__init__()
+        self.top_k = config.selector_top_k
+        self.predecessor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.hidden_projection = nn.Linear(config.hidden_size, config.selector_rank, bias=False)
+
+    def select(self, hidden, logits, anchor_ids, temperature):
+        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k:]
+        unary = mx.take_along_axis(logits, candidates, axis=-1)
+        hidden = self.hidden_projection(hidden)
+        predecessor = anchor_ids
+        path, q_rows = [], []
+        for position in range(hidden.shape[1]):
+            edges = mx.sum(
+                self.predecessor_codebook(predecessor)[:, None]
+                * hidden[:, position, None]
+                * self.successor_codebook(candidates[:, position]),
+                axis=-1,
+            )
+            scores = unary[:, position] + edges
+            if temperature > 0:
+                q = _sampling_probs(scores[:, None], temperature)[:, 0]
+                selected = _sample_probs(q)
+                q_rows.append(q)
+            else:
+                selected = mx.argmax(scores, axis=-1)
+            predecessor = mx.take_along_axis(
+                candidates[:, position], selected[:, None], axis=-1
+            )[:, 0]
+            path.append(predecessor)
+        return (
+            mx.stack(path, axis=1),
+            candidates,
+            mx.stack(q_rows, axis=1) if q_rows else None,
+        )
+
+
 class DFlashDraftModel(nn.Module):
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
@@ -138,7 +336,7 @@ class DFlashDraftModel(nn.Module):
         concat_dim = len(config.target_layer_ids) * config.hidden_size
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers = [DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        self.layers = [self.layer_class(config, i) for i in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(
             config.head_dim,
@@ -162,7 +360,10 @@ class DFlashDraftModel(nn.Module):
         else:
             raise AttributeError(f"Cannot find embed_tokens in {type(target_model).__name__}")
         self.embed_tokens = inner.embed_tokens
-        self.embed_scale = getattr(self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0))
+        self.embed_scale = (
+            getattr(self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0))
+            * self.config.input_embedding_scale
+        )
         lm = getattr(target_model, "language_model", target_model)
         self.lm_head = getattr(target_model, "lm_head", None) or getattr(lm, "lm_head", None) or self.embed_tokens.as_linear
         return self
@@ -178,7 +379,7 @@ class DFlashDraftModel(nn.Module):
                 caches.append(KVCache())
         return caches
 
-    def __call__(
+    def hidden_states(
         self,
         inputs,
         target_hidden,
@@ -191,11 +392,34 @@ class DFlashDraftModel(nn.Module):
             h = layer(h, h_ctx, self.rope, c)
         if logits_start:
             h = h[:, logits_start:]
-        logits = self.lm_head(self.norm(h))
-        if self.config.final_logit_softcapping is not None:
+        return self.norm(h)
+
+    def __call__(self, inputs, target_hidden, cache, logits_start: int = 0):
+        return self.compute_logits(
+            self.hidden_states(inputs, target_hidden, cache, logits_start)
+        )
+
+    def compute_logits(self, hidden):
+        logits = self.lm_head(hidden)
+        logits = logits * self.config.output_multiplier
+        if self.config.final_logit_softcapping is not None and self.config.final_logit_softcapping > 0:
             cap = self.config.final_logit_softcapping
             logits = mx.tanh(logits / cap) * cap
         return logits
+
+
+class DFlash2DraftModel(DFlashDraftModel):
+    layer_class = DFlash2DecoderLayer
+
+    def __init__(self, config: DFlashConfig):
+        super().__init__(config)
+        self.candidate_selector = CandidateSelector(config)
+
+    def propose(self, inputs, target_hidden, cache, temperature, logits_start: int = 0):
+        hidden = self.hidden_states(inputs, target_hidden, cache, logits_start)
+        return self.candidate_selector.select(
+            hidden, self.compute_logits(hidden), inputs[:, 0], temperature
+        )
 
 
 def load(model_id: str):
@@ -206,6 +430,8 @@ def load(model_id: str):
 def load_draft(draft_id: str) -> DFlashDraftModel:
     path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
     cfg = json.loads((path / "config.json").read_text())
+    dflash = cfg.get("dflash_config", {})
+    rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
     layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
     if len(layer_types) != cfg["num_hidden_layers"]:
         raise ValueError("Draft config layer_types length must match num_hidden_layers.")
@@ -223,24 +449,44 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         intermediate_size=cfg["intermediate_size"],
         vocab_size=cfg["vocab_size"],
         rms_norm_eps=cfg["rms_norm_eps"],
-        rope_theta=cfg["rope_theta"],
+        rope_theta=cfg.get("rope_theta", (rope or {}).get("rope_theta", 10000.0)),
         max_position_embeddings=cfg["max_position_embeddings"],
-        block_size=cfg["block_size"],
-        target_layer_ids=tuple(cfg["dflash_config"]["target_layer_ids"]),
+        block_size=int(dflash.get("block_size", cfg.get("block_size", 16))),
+        target_layer_ids=tuple(dflash["target_layer_ids"]),
         num_target_layers=cfg["num_target_layers"],
-        mask_token_id=cfg["dflash_config"]["mask_token_id"],
-        rope_scaling=cfg.get("rope_scaling"),
+        mask_token_id=dflash["mask_token_id"],
+        rope_scaling=rope,
         layer_types=layer_types,
         sliding_window=cfg.get("sliding_window"),
-        final_logit_softcapping=cfg.get("final_logit_softcapping"),
+        final_logit_softcapping=dflash.get(
+            "final_logit_softcapping", cfg.get("final_logit_softcapping")
+        ),
+        input_embedding_scale=float(dflash.get("input_embedding_scale", 1.0)),
+        output_multiplier=float(dflash.get("output_multiplier", 1.0)),
+        conv_kernel_size=int(dflash.get("conv_kernel_size", 0)),
+        conv_group_size=int(dflash.get("conv_group_size", 0)),
+        selector_rank=int(dflash.get("selector_rank", 0)),
+        selector_top_k=int(dflash.get("selector_top_k", 0)),
+        is_causal=cfg.get("is_causal"),
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
-    model = DFlashDraftModel(config)
+    model_class = (
+        DFlash2DraftModel
+        if "DFlash2DraftModel" in (cfg.get("architectures") or [])
+        else DFlashDraftModel
+    )
+    if model_class is DFlash2DraftModel:
+        for name in ("predecessor_codebook", "successor_codebook"):
+            key = f"candidate_selector.{name}"
+            weights[f"{key}.weight"] = weights.pop(key)
+    model = model_class(config)
+    model.eval()
     model.load_weights(list(weights.items()))
+    mx.eval(model.parameters())
     return model
 
 
-def _trim_recent_cache(cache: List[Any], num_tokens: int) -> None:
+def _trim_recent_cache(cache: list[Any], num_tokens: int) -> None:
     if num_tokens <= 0:
         return
     for c in cache:
@@ -325,7 +571,13 @@ class _GDNStateCapture:
             conv_input = mx.concatenate([conv_state, qkv], axis=1)
             capture.conv_data.append((conv_input, self_layer.conv_kernel_size))
             if cache is not None:
-                cache[0] = conv_input[:, -(self_layer.conv_kernel_size - 1):]
+                n_keep = self_layer.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:])
             conv_out = nn.silu(self_layer.conv1d(conv_input))
             q, k, v = [
                 t.reshape(B, S, h, d)
@@ -341,10 +593,12 @@ class _GDNStateCapture:
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
             capture._gdn_inputs.append((q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask))
             out, new_state = _gd_mod.gated_delta_update(
-                q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask, use_kernel=True
+                q, k, v, a, b, self_layer.A_log, self_layer.dt_bias, state, mask,
+                use_kernel=not self_layer.training,
             )
             if cache is not None:
                 cache[1] = new_state
+                cache.advance(S)
             out = self_layer.norm(out, z)
             out = self_layer.out_proj(out.reshape(B, S, -1))
             if self_layer.sharding_group is not None:
@@ -393,21 +647,23 @@ class _GDNStateCapture:
                 )
                 c.cache[1] = state
                 conv_input, K = self.conv_data[j]
-                c.cache[0] = conv_input[:, accepted + 1 : accepted + K]
+                c.cache[0] = mx.contiguous(
+                    conv_input[:, accepted + 1 : accepted + K]
+                )
                 j += 1
 
 
 @dataclass
 class GenerationResponse:
     text: str
-    tokens: List[int]
-    accepted: int
+    tokens: list[int]
+    accepted: int | None
     prompt_tokens: int
     prompt_tps: float
     generation_tokens: int
     generation_tps: float
     peak_memory: float
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
 
 def _make_response(
@@ -426,13 +682,55 @@ def _make_response(
     )
 
 
+def _prefill_target(model, prompt, cache, hidden_limit, step_size):
+    if step_size <= 0:
+        raise ValueError("prefill_step_size must be positive.")
+    hidden_chunks = []
+    start = 0
+    while start < prompt.size:
+        remaining = prompt.size - start
+        end = start + (1 if remaining == 1 else min(step_size, remaining - 1))
+        logits = model(prompt[None, start:end], cache)
+        hidden = mx.concatenate(model._hidden_states, axis=-1)
+        if hidden_limit is None:
+            hidden_chunks.append(hidden)
+        else:
+            if hidden_chunks:
+                hidden = mx.concatenate((hidden_chunks[0], hidden), axis=1)
+            hidden_chunks = [hidden[:, -hidden_limit:]]
+        if end < prompt.size:
+            mx.eval([c.state for c in cache], hidden_chunks[-1])
+            mx.clear_cache()
+        start = end
+    hidden = (
+        hidden_chunks[0]
+        if len(hidden_chunks) == 1
+        else mx.concatenate(hidden_chunks, axis=1)
+    )
+    return logits[:, -1:], hidden, prompt.size - hidden.shape[1]
+
+
 def stream_generate(
     model, draft, tokenizer, prompt,
-    block_size=None, max_tokens=256, temperature=0.0, sampler=None,
+    block_size=None, max_tokens=256, temperature=0.0, top_p=1.0, top_k=0,
+    prefill_step_size=2048,
+):
+    with wired_limit(model, [generation_stream]):
+        yield from _stream_generate(
+            model, draft, tokenizer, prompt,
+            block_size, max_tokens, temperature, top_p, top_k,
+            prefill_step_size,
+        )
+
+
+def _stream_generate(
+    model, draft, tokenizer, prompt,
+    block_size=None, max_tokens=256, temperature=0.0, top_p=1.0, top_k=0,
+    prefill_step_size=2048,
 ):
     _patch_model(model, draft.config.target_layer_ids)
     block_size = block_size if block_size is not None else int(draft.config.block_size)
-    sampler = sampler or make_sampler(temp=temperature)
+    sampler = make_sampler(temperature, top_p, top_k)
 
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -445,24 +743,27 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
     mask_id = int(draft.config.mask_token_id)
-    tokens = prompt.tolist()
+    tokens = []
 
     target_cache = make_prompt_cache(model)
     draft_cache = make_prompt_cache(draft)
     draft.bind(model)
     _target_can_trim = can_trim_prompt_cache(target_cache)
-    if not _target_can_trim and not _HAS_GDN:
-        raise RuntimeError(
-            "This MLX model requires gated-delta rollback support, but "
-            "mlx_lm.models.gated_delta is unavailable."
-        )
-    _capture = _GDNStateCapture() if not _target_can_trim else None
+    _capture = None
 
     try:
         tic = time.perf_counter()
         with mx.stream(generation_stream):
-            logits = model(prompt[None], target_cache)
-            hidden = mx.concatenate(model._hidden_states, axis=-1)
+            hidden_limit = (
+                draft.config.sliding_window - 1
+                if all(t == "sliding_attention" for t in draft.config.layer_types)
+                else None
+            )
+            logits, hidden, hidden_offset = _prefill_target(
+                model, prompt, target_cache, hidden_limit, prefill_step_size
+            )
+            for cache in draft_cache:
+                cache.offset = hidden_offset
         mx.eval(logits, hidden)
         prompt_tps = prompt.size / (time.perf_counter() - tic)
 
@@ -474,19 +775,22 @@ def stream_generate(
         if token in tokenizer.eos_token_ids:
             detokenizer.add_token(token)
             detokenizer.finalize()
-            yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, "stop")
+            yield _make_response(detokenizer.last_segment, [token], None, prompt.size, prompt_tps, n, tic, "stop")
             return
 
         detokenizer.add_token(token)
         yield _make_response(
             detokenizer.last_segment,
             [token],
-            1,
+            None,
             prompt.size,
             prompt_tps,
             n,
             tic,
         )
+
+        if not _target_can_trim:
+            _capture = _GDNStateCapture()
 
         while n < max_tokens:
             bs = min(block_size, max_tokens - n + 1)
@@ -495,15 +799,22 @@ def stream_generate(
 
             with mx.stream(generation_stream):
                 block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
-                draft_logits = draft(
-                    block,
-                    hidden,
-                    draft_cache,
-                    logits_start=1,
-                )
+                if isinstance(draft, DFlash2DraftModel):
+                    draft_tokens, draft_indices, draft_probs = draft.propose(
+                        block, hidden, draft_cache, temperature, logits_start=1
+                    )
+                else:
+                    draft_logits = draft(block, hidden, draft_cache, logits_start=1)
+                    if temperature > 0:
+                        draft_probs = _sampling_probs(
+                            draft_logits, temperature, top_p, top_k
+                        )
+                        draft_tokens = _sample_probs(draft_probs)
+                        draft_indices = None
+                    else:
+                        draft_tokens = mx.argmax(draft_logits, axis=-1)
                 if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
                     _trim_recent_cache(draft_cache, trim_n)
-                draft_tokens = sampler(draft_logits)
             mx.async_eval(draft_tokens)
 
             if _capture is not None:
@@ -512,12 +823,25 @@ def stream_generate(
                 verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
                 logits = model(verify_input, target_cache)
                 hidden = mx.concatenate(model._hidden_states, axis=-1)
-                target_tokens = sampler(logits)
-            mx.async_eval(target_tokens, hidden)
+                if temperature > 0:
+                    target_probs = _sampling_probs(logits, temperature, top_p, top_k)
+                else:
+                    target_tokens = mx.argmax(logits, axis=-1)
+            mx.async_eval(target_probs if temperature > 0 else target_tokens, hidden)
 
-            d_list, t_list = draft_tokens[0].tolist(), target_tokens[0].tolist()
-            accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
-            new_tokens = d_list[:accepted] + [t_list[accepted]]
+            d_list = draft_tokens[0].tolist()
+            if temperature > 0:
+                accepted, bonus = _rejection_sample(
+                    draft_tokens, target_probs, draft_probs, draft_indices
+                )
+            else:
+                t_list = target_tokens[0].tolist()
+                accepted = next(
+                    (i for i in range(len(d_list)) if d_list[i] != t_list[i]),
+                    len(d_list),
+                )
+                bonus = t_list[accepted]
+            new_tokens = d_list[:accepted] + [bonus]
             new_tokens = new_tokens[:max_tokens - n]
 
             eos_idx = next((i for i, t in enumerate(new_tokens) if t in tokenizer.eos_token_ids), None)
@@ -531,7 +855,7 @@ def stream_generate(
                 yield _make_response(
                     detokenizer.last_segment,
                     new_tokens,
-                    accepted + 1,
+                    len(new_tokens),
                     prompt.size,
                     prompt_tps,
                     n,
@@ -543,15 +867,16 @@ def stream_generate(
             for t in new_tokens:
                 detokenizer.add_token(t)
             tokens.extend(new_tokens)
+            previous_n = n
             n += len(new_tokens)
 
-            if n % 256 == 0:
+            if n // 256 > previous_n // 256:
                 mx.clear_cache()
 
             yield _make_response(
                 detokenizer.last_segment,
                 new_tokens,
-                accepted + 1,
+                len(new_tokens),
                 prompt.size,
                 prompt_tps,
                 n,
@@ -570,7 +895,7 @@ def stream_generate(
         yield _make_response(
             detokenizer.last_segment,
             [],
-            0,
+            None,
             prompt.size,
             prompt_tps,
             n,

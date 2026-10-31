@@ -1,38 +1,59 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "dflash"
 version = "0.1.0"
 description = "DFlash: Block Diffusion for Flash Speculative Decoding"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Z Lab" }]
 requires-python = ">=3.10"
-dependencies = [
-    "rich",
-    "loguru",
-    "numpy",
-    "tqdm",
-    "datasets",
-    "requests",
-    "huggingface-hub",
+keywords = [
+    "deep-learning",
+    "generative-ai",
+    "inference",
+    "speculative-decoding",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "tqdm==4.70.0",
+    "datasets==5.0.1",
+    "requests==2.34.2",
+]
+
+[project.scripts]
+dflash = "dflash.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/z-lab/dflash"
+Repository = "https://github.com/z-lab/dflash"
+Issues = "https://github.com/z-lab/dflash/issues"
+Blog = "https://inco.ai/blog/dflash2/"
+Models = "https://huggingface.co/collections/z-lab/dflash-2"
 
 [tool.setuptools.packages.find]
 include = ["dflash*"]
 
 [project.optional-dependencies]
-transformers = [
-    "torch",
-    "transformers==4.57.1",
-    "accelerate",
-    "typing-extensions",
-]
-sglang = [
-    "sglang[all] @ git+https://github.com/sgl-project/sglang.git@refs/pull/23000/head#subdirectory=python",
-    "transformers",
-]
-vllm = [
-    "vllm",
-    "datasets>=3,<4",
-    "huggingface-hub<1",
-]
-mlx = [
-    "mlx==0.31.2",
-    "mlx-lm==0.31.3",
+local = [
+    "jinja2==3.1.6; sys_platform == 'linux'",
+    "torch==2.13.0; sys_platform == 'linux'",
+    "transformers==5.15.0; sys_platform == 'linux'",
+    "mlx==0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm==0.31.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "huggingface-hub==1.27.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]

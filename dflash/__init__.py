@@ -1,4 +1,5 @@
 __all__ = [
+    "DFlash2DraftModel",
     "DFlashDraftModel",
     "extract_context_feature",
     "load_and_process_dataset",
@@ -12,11 +13,17 @@ def __getattr__(name):
 
         return load_and_process_dataset
 
-    if name in {"DFlashDraftModel", "extract_context_feature", "sample"}:
-        from .model import DFlashDraftModel, extract_context_feature, sample
+    if name in {"DFlashDraftModel", "DFlash2DraftModel", "extract_context_feature", "sample"}:
+        from .model import (
+            DFlash2DraftModel,
+            DFlashDraftModel,
+            extract_context_feature,
+            sample,
+        )
 
         return {
             "DFlashDraftModel": DFlashDraftModel,
+            "DFlash2DraftModel": DFlash2DraftModel,
             "extract_context_feature": extract_context_feature,
             "sample": sample,
         }[name]
