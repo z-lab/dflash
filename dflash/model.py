@@ -481,7 +481,7 @@ def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
     blocks = hidden.view(batch, length, groups, group_size)
     dynamic = dynamic.view(batch, length, base.shape[0], groups, 1)
     output = torch.zeros_like(blocks)
-    for offset in range(base.shape[0]):
+    for offset in range(min(base.shape[0], length)):
         values = blocks if offset == 0 else F.pad(blocks[:, :-offset], (0, 0, 0, 0, offset, 0))
         kernel = base[offset].view(1, 1, groups, group_size).to(hidden.dtype)
         output = output + kernel * values
