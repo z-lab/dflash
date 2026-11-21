@@ -194,11 +194,18 @@ def _make_decode_metrics(num_output_tokens: int, generation_tps: float, acceptan
 
 
 def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
-    baseline_tpot = statistics.mean(r[1].time_per_output_token for r in responses)
-    dflash_tpot = statistics.mean(r[block_size].time_per_output_token for r in responses)
-    print(f"Baseline throughput: {1 / baseline_tpot:.2f} tok/s")
-    print(f"DFlash throughput:  {1 / dflash_tpot:.2f} tok/s")
-    print(f"Decoding speedup: {baseline_tpot / dflash_tpot:.2f}")
+    timed_pairs = [
+        r for r in responses
+        if r[1].time_per_output_token is not None and r[block_size].time_per_output_token is not None
+    ]
+    if timed_pairs:
+        baseline_tpot = statistics.mean(r[1].time_per_output_token for r in timed_pairs)
+        dflash_tpot = statistics.mean(r[block_size].time_per_output_token for r in timed_pairs)
+        print(f"Baseline throughput: {1 / baseline_tpot:.2f} tok/s")
+        print(f"DFlash throughput:  {1 / dflash_tpot:.2f} tok/s")
+        print(f"Decoding speedup: {baseline_tpot / dflash_tpot:.2f}")
+    else:
+        print("Decode throughput and speedup: n/a (no paired decode tokens)")
 
     per_request = [
         r[block_size].acceptance_lengths

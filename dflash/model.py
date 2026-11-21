@@ -313,13 +313,15 @@ def dflash_generate(
         return output_ids
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
+    # Prefill already emitted the first token before the decode clock started.
+    num_decode_tokens = max(num_output_tokens - 1, 0)
     total_decode_time = _cuda_time() - decode_start
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=num_input_tokens,
         num_output_tokens=num_output_tokens,
         time_to_first_token=time_to_first_token,
-        time_per_output_token=total_decode_time / num_output_tokens,
+        time_per_output_token=total_decode_time / num_decode_tokens if num_decode_tokens else None,
         acceptance_lengths=acceptance_lengths,
     )
 
