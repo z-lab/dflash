@@ -47,6 +47,8 @@ def _parser() -> argparse.ArgumentParser:
     edits.add_argument("--max-new-tokens", type=int, default=2048)
     edits.add_argument("--timeout-s", type=int, default=300)
     edits.add_argument("--reasoning")
+    edits.add_argument("--record-token-ids", action="store_true",
+                       help="Record exact output IDs from llama.cpp servers with verbose token support")
     edits.add_argument("--output", help="Write a JSON report, including one record per request")
     return parser
 

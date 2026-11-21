@@ -135,6 +135,7 @@ dflash benchmark-edits --base-url http://127.0.0.1:8000 --model Qwen/Qwen3.8-27B
 
 Repeat with the same target and settings under serial decoding, source lookup alone and source
 lookup with DFlash2 fallback. Configure each method on the server before giving it a label.
+On llama.cpp, add `--record-token-ids` to compare the complete output ID sequences as well as text hashes.
 
 ## Acknowledgement
 

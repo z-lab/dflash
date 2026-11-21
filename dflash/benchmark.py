@@ -139,6 +139,7 @@ def send_openai(
     top_k: int,
     timeout_s: int,
     reasoning: str | None = None,
+    return_token_ids: bool = False,
 ) -> dict:
     body: dict = {
         "model": model,
@@ -149,6 +150,8 @@ def send_openai(
         "chat_template_kwargs": _reasoning_kwargs(reasoning),
         "return_meta_info": True,
     }
+    if return_token_ids:
+        body.update(return_tokens=True, verbose=True)
     if top_k > 0:
         body["top_k"] = top_k
     response = requests.post(

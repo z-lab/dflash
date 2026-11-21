@@ -36,17 +36,20 @@ class EditBenchTest(unittest.TestCase):
         def respond(url, *, json, timeout):
             self.assertEqual(url, "http://example.invalid/v1/chat/completions")
             self.assertFalse(json["chat_template_kwargs"]["enable_thinking"])
+            self.assertTrue(json["return_tokens"])
+            self.assertTrue(json["verbose"])
             prompts.append(json["messages"][0]["content"])
             response = Mock()
             response.json.return_value = {
                 "choices": [{"finish_reason": "length", "message": {"content": ""}}],
                 "usage": {"completion_tokens": 5},
+                "__verbose": {"tokens": [103, 55, 55, 42, 1]},
             }
             return response
 
         with patch("dflash.benchmark.requests.post", side_effect=respond), redirect_stdout(io.StringIO()) as out:
             main(["benchmark-edits", "--base-url", "http://example.invalid", "--model", "target",
-                  "--label", "stock", "--repeats", "2", "--reasoning", "off"])
+                  "--label", "stock", "--repeats", "2", "--reasoning", "off", "--record-token-ids"])
 
         report = json.loads(out.getvalue())
         self.assertEqual(prompts[1:], list(CASES.values()) * 2)
@@ -57,3 +60,11 @@ class EditBenchTest(unittest.TestCase):
             self.assertFalse(row["passed"])
             self.assertEqual(row["output_tokens"], 5)
             self.assertIsNone(row["server_decode_tps"])
+            self.assertEqual(row["token_ids"], [103, 55, 55, 42, 1])
+
+    def test_requested_ids_must_be_complete(self):
+        response = {"usage": {"completion_tokens": 2}, "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+                    "__verbose": {"tokens": [42]}}
+        with patch("dflash.edit_benchmark.send_openai", return_value=response):
+            with self.assertRaisesRegex(ValueError, "one native ID"):
+                main(["benchmark-edits", "--model", "target", "--label", "trial", "--record-token-ids"])

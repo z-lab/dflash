@@ -101,7 +101,7 @@ def run(args):
     def request(prompt, limit):
         return send_openai(args.base_url, [{"role": "user", "content": prompt}], model=args.model,
                            max_new_tokens=limit, temperature=0.0, top_p=1.0, top_k=0,
-                           timeout_s=args.timeout_s, reasoning=args.reasoning)
+                           timeout_s=args.timeout_s, reasoning=args.reasoning, return_token_ids=args.record_token_ids)
 
     request("Reply with OK.", min(8, args.max_new_tokens))
     rows = []
@@ -115,6 +115,12 @@ def run(args):
             timing = response.get("timings") or {}
             meta = response.get("meta_info") or {}
             output_tokens = (response.get("usage") or {}).get("completion_tokens")
+            native_ids = {}
+            if args.record_token_ids:
+                ids = (response.get("__verbose") or {}).get("tokens")
+                if not isinstance(ids, list) or len(ids) != output_tokens or any(type(i) is not int for i in ids):
+                    raise ValueError("The server did not return one native ID for each completion token")
+                native_ids["token_ids"] = ids
             rows.append(dict(case=case, repeat=rep + 1,
                              passed=choice["finish_reason"] == "stop" and grade(case, text),
                              finish_reason=choice["finish_reason"],
@@ -124,7 +130,7 @@ def run(args):
                              server_decode_ms=timing.get("predicted_ms"),
                              server_decode_tps=timing.get("predicted_per_second"),
                              proposed=timing.get("draft_n"), accepted=timing.get("draft_n_accepted"),
-                             mean_accepted_length=meta.get("spec_accept_length")))
+                             mean_accepted_length=meta.get("spec_accept_length"), **native_ids))
     report = {"label": args.label, "model": args.model, "repeats": args.repeats,
               "max_new_tokens": args.max_new_tokens, "reasoning": args.reasoning, "requests": rows}
     encoded = json.dumps(report, indent=2, allow_nan=False) + "\n"
