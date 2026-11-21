@@ -121,6 +121,21 @@ dflash benchmark mlx \
     --dataset gsm8k --max-samples 128 --reasoning xhigh --block-size 5 --draft-bits 4
 ```
 
+### Source edits and new code
+
+Run the same three local fixtures against each serving configuration. The single-file edit is
+graded byte for byte, the multi-file edit by applying its search/replacement blocks in memory,
+and the new SQL query against three databases. Each run warms the server and records individual
+request times, completion hashes, grades, and server-reported decoding counters when available.
+
+```bash
+dflash benchmark-edits --base-url http://127.0.0.1:8000 --model Qwen/Qwen3.8-27B \
+    --label stock-dflash2 --reasoning off --repeats 2 --output stock-dflash2.json
+```
+
+Repeat with the same target and settings under serial decoding, source lookup alone and source
+lookup with DFlash2 fallback. Configure each method on the server before giving it a label.
+
 ## Acknowledgement
 
 Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the team at [@modal-labs](https://github.com/modal-labs) for their fast, high-quality support in bringing DFlash to SGLang. And huge thanks as well to [@benchislett](https://github.com/benchislett) at NVIDIA for his work in bringing DFlash to vLLM and helping make it available to the broader serving community.
