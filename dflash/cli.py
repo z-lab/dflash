@@ -38,6 +38,18 @@ def _parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--max-samples", type=int)
     benchmark.add_argument("--num-prompts", type=int, default=1024)
     benchmark.add_argument("--concurrency", type=int, default=1)
+
+    edits = commands.add_parser("benchmark-edits", help="Grade source edits and new code on a serving endpoint")
+    edits.add_argument("--base-url", default="http://127.0.0.1:30000")
+    edits.add_argument("--model", required=True)
+    edits.add_argument("--label", required=True, help="Name of the server configuration being measured")
+    edits.add_argument("--repeats", type=int, default=2)
+    edits.add_argument("--max-new-tokens", type=int, default=2048)
+    edits.add_argument("--timeout-s", type=int, default=300)
+    edits.add_argument("--reasoning")
+    edits.add_argument("--record-token-ids", action="store_true",
+                       help="Record exact output IDs from llama.cpp servers with verbose token support")
+    edits.add_argument("--output", help="Write a JSON report, including one record per request")
     return parser
 
 
@@ -134,6 +146,13 @@ def _generate_openai(args) -> None:
 def main(argv=None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "benchmark-edits":
+        from .edit_benchmark import run
+
+        if min(args.repeats, args.max_new_tokens, args.timeout_s) < 1:
+            parser.error("repeats, max-new-tokens and timeout-s must be positive")
+        run(args)
+        return
     if args.backend != "openai" and args.draft is None:
         parser.error("--draft is required for local backends")
     if args.command == "benchmark":
