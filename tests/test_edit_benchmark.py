@@ -1,6 +1,11 @@
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import Mock, patch
 
-from dflash.edit_benchmark import MODULES, SOURCE, fenced, grade
+from dflash.cli import main
+from dflash.edit_benchmark import CASES, MODULES, SOURCE, fenced, grade
 
 
 class EditBenchTest(unittest.TestCase):
@@ -24,3 +29,31 @@ class EditBenchTest(unittest.TestCase):
         self.assertFalse(grade("new-code", "DELETE FROM readings"))
         self.assertFalse(grade("new-code", "SELECT load_extension('unused')"))
         self.assertFalse(grade("new-code", "SELECT sensor, SUM(value) FROM readings GROUP BY sensor"))
+
+    def test_cli_report_excludes_warmup_and_rejects_truncation(self):
+        prompts = []
+
+        def respond(url, *, json, timeout):
+            self.assertEqual(url, "http://example.invalid/v1/chat/completions")
+            self.assertFalse(json["chat_template_kwargs"]["enable_thinking"])
+            prompts.append(json["messages"][0]["content"])
+            response = Mock()
+            response.json.return_value = {
+                "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+                "usage": {"completion_tokens": 5},
+            }
+            return response
+
+        with patch("dflash.benchmark.requests.post", side_effect=respond), redirect_stdout(io.StringIO()) as out:
+            main(["benchmark-edits", "--base-url", "http://example.invalid", "--model", "target",
+                  "--label", "stock", "--repeats", "2", "--reasoning", "off"])
+
+        report = json.loads(out.getvalue())
+        self.assertEqual(prompts[1:], list(CASES.values()) * 2)
+        self.assertEqual(len(prompts), 7)
+        self.assertEqual(report["label"], "stock")
+        self.assertEqual([r["case"] for r in report["requests"]], list(CASES) * 2)
+        for row in report["requests"]:
+            self.assertFalse(row["passed"])
+            self.assertEqual(row["output_tokens"], 5)
+            self.assertIsNone(row["server_decode_tps"])
